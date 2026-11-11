@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use crate::errors::VariableError;
 use crate::scanner::context::{ScanState, create_wasm_store_and_ctx};
-use crate::scanner::{DataSnippets, ScanContext};
+use crate::scanner::{DataSnippets, ScanContext, ScanStatus};
 use crate::wasm::runtime::Store;
 use crate::{Rules, ScanError, ScanResults, Variable};
 
@@ -232,7 +232,7 @@ impl<'r> Scanner<'r> {
             mem::take(&mut self.snippets),
         ));
 
-        Ok(ScanResults::new(ctx))
+        Ok(ScanResults::new(ctx, ScanStatus::Complete))
     }
 
     /// Sets the value of a global variable.

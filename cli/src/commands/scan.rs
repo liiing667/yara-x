@@ -16,7 +16,9 @@ use yansi::Color::{Cyan, Green, Red, Yellow};
 use yansi::Paint;
 
 use yara_x::errors::ScanError;
-use yara_x::{MetaValue, Patterns, Rule, Rules, ScanOptions, Scanner};
+use yara_x::{
+    MetaValue, Patterns, Rule, Rules, ScanOptions, ScanStatus, Scanner,
+};
 
 use crate::commands::{
     compilation_args, compile_rules, get_external_vars,
@@ -71,6 +73,10 @@ pub fn scan() -> Command {
             arg!(--"max-matches-per-pattern" <MATCHES>)
                 .help("Maximum number of matches per pattern")
                 .long_help(help::MAX_MATCHES_PER_PATTERN_LONG_HELP)
+                .value_parser(value_parser!(usize)),
+            arg!(--"max-scan-size" <FILE_SIZE>)
+                .help("Scan at most FILE_SIZE bytes from each file")
+                .long_help(help::MAX_SCAN_SIZE_LONG_HELP)
                 .value_parser(value_parser!(usize)),
             arg!(-x --"module-data")
                 .help("Pass FILE's content as extra data to MODULE")
@@ -190,6 +196,7 @@ pub fn exec_scan(args: &ArgMatches, config: &Config) -> anyhow::Result<()> {
     let only_tag = args.get_one::<String>("tag");
     let max_matches_per_pattern =
         args.get_one::<usize>("max-matches-per-pattern");
+    let max_scan_size = args.get_one::<usize>("max-scan-size");
 
     let timeout =
         args.get_one::<u64>("timeout").map(|t| Duration::from_secs(*t));
@@ -330,6 +337,10 @@ pub fn exec_scan(args: &ArgMatches, config: &Config) -> anyhow::Result<()> {
                 scanner.max_matches_per_pattern(*max_matches_per_pattern);
             }
 
+            if let Some(max_scan_size) = max_scan_size {
+                scanner.max_scan_size(*max_scan_size);
+            }
+
             scanner
         },
         // File handler. Called for every file found while walking the path.
@@ -400,6 +411,7 @@ pub fn exec_scan(args: &ArgMatches, config: &Config) -> anyhow::Result<()> {
             // match is actually included in the output and not ignored.
             if output_handler.on_file_scanned(
                 &file_path,
+                scan_results.scan_status(),
                 &mut wanted_rules,
                 output,
             ) {
@@ -621,12 +633,55 @@ mod output_handler {
     struct JsonOutput<'a> {
         path: &'a str,
         rules: &'a [RuleJson],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scan_status: Option<ScanStatusJson>,
     }
 
     #[derive(serde::Serialize)]
     struct JsonCountOutput<'a> {
         path: &'a str,
         count: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scan_status: Option<ScanStatusJson>,
+    }
+
+    #[derive(serde::Serialize, Clone, Copy)]
+    struct ScanStatusJson {
+        status: &'static str,
+        truncated: bool,
+        original_size: u64,
+        scanned_size: u64,
+        reason: &'static str,
+    }
+
+    fn scan_status_json(status: ScanStatus) -> Option<ScanStatusJson> {
+        match status {
+            ScanStatus::Complete => None,
+            ScanStatus::Truncated { original_size, scanned_size, reason } => {
+                Some(ScanStatusJson {
+                    status: "truncated",
+                    truncated: true,
+                    original_size,
+                    scanned_size,
+                    reason,
+                })
+            }
+        }
+    }
+
+    fn scan_status_text(
+        file_path: &Path,
+        status: ScanStatus,
+    ) -> Option<String> {
+        match status {
+            ScanStatus::Complete => None,
+            ScanStatus::Truncated { original_size, scanned_size, reason } => {
+                Some(format!(
+                    "{}: scan truncated: original_size={original_size} scanned_size={scanned_size} reason={reason}",
+                    file_path.display()
+                ))
+            }
+        }
     }
 
     fn rules_to_json(
@@ -714,6 +769,7 @@ mod output_handler {
         fn on_file_scanned(
             &self,
             file_path: &Path,
+            scan_status: ScanStatus,
             scan_results: &mut dyn Iterator<Item = Rule>,
             output: &Sender<Message>,
         ) -> bool;
@@ -735,6 +791,7 @@ mod output_handler {
         fn on_file_scanned(
             &self,
             file_path: &Path,
+            scan_status: ScanStatus,
             scan_results: &mut dyn Iterator<Item = Rule>,
             output: &Sender<Message>,
         ) -> bool {
@@ -749,6 +806,11 @@ mod output_handler {
                             count
                         )))
                         .unwrap();
+                }
+
+                if let Some(status) = scan_status_text(file_path, scan_status)
+                {
+                    output.send(Message::Info(status)).unwrap();
                 }
 
                 return count > 0;
@@ -899,6 +961,10 @@ mod output_handler {
                 output.send(Message::Info(msg)).unwrap();
             }
 
+            if let Some(status) = scan_status_text(file_path, scan_status) {
+                output.send(Message::Info(status)).unwrap();
+            }
+
             result
         }
 
@@ -921,20 +987,23 @@ mod output_handler {
         fn on_file_scanned(
             &self,
             file_path: &Path,
+            scan_status: ScanStatus,
             scan_results: &mut dyn Iterator<Item = Rule>,
             output: &Sender<Message>,
         ) -> bool {
             let path = file_path.to_str().unwrap();
+            let scan_status = scan_status_json(scan_status);
 
             if self.output_options.count_only {
                 let count = scan_results.count();
 
-                if count > 0 {
+                if count > 0 || scan_status.is_some() {
                     output
                         .send(Message::Info(
                             serde_json::to_string(&JsonCountOutput {
                                 count,
                                 path,
+                                scan_status,
                             })
                             .unwrap(),
                         ))
@@ -947,19 +1016,20 @@ mod output_handler {
             let matching_rules =
                 rules_to_json(&self.output_options, scan_results);
 
-            if matching_rules.is_empty() {
+            if matching_rules.is_empty() && scan_status.is_none() {
                 return false;
             }
 
             let line = serde_json::to_string(&JsonOutput {
                 path,
                 rules: matching_rules.as_slice(),
+                scan_status,
             })
             .unwrap();
 
             output.send(Message::Info(line)).unwrap();
 
-            true
+            !matching_rules.is_empty()
         }
 
         fn on_done(&self, _output: &Sender<Message>) {
@@ -983,6 +1053,8 @@ mod output_handler {
         rule: String,
         file: String,
         #[serde(skip_serializing_if = "Option::is_none")]
+        scan_status: Option<ScanStatusJson>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         meta: Option<HashMap<String, serde_json::Value>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         tags: Option<Vec<String>>,
@@ -994,17 +1066,29 @@ mod output_handler {
     struct OutputJson {
         version: String,
         matches: Vec<MatchJson>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        scan_status: Vec<FileScanStatusJson>,
+    }
+
+    #[derive(serde::Serialize, Clone)]
+    struct FileScanStatusJson {
+        path: String,
+        #[serde(flatten)]
+        status: ScanStatusJson,
     }
 
     pub(super) struct JsonOutputHandler {
         output_options: OutputOptions,
         output_buffer: std::sync::Arc<std::sync::Mutex<Vec<MatchJson>>>,
+        status_buffer:
+            std::sync::Arc<std::sync::Mutex<Vec<FileScanStatusJson>>>,
     }
 
     impl JsonOutputHandler {
         pub(super) fn new(output_options: OutputOptions) -> Self {
             let output_buffer = Default::default();
-            Self { output_options, output_buffer }
+            let status_buffer = Default::default();
+            Self { output_options, output_buffer, status_buffer }
         }
     }
 
@@ -1062,21 +1146,31 @@ mod output_handler {
         fn on_file_scanned(
             &self,
             file_path: &Path,
+            scan_status: ScanStatus,
             scan_results: &mut dyn Iterator<Item = Rule>,
             _output: &Sender<Message>,
         ) -> bool {
-            let mut matching_rules = scan_results.peekable();
-
-            if matching_rules.peek().is_none() {
-                return false;
-            }
-
             let path = dunce::canonicalize(file_path)
                 .ok()
                 .as_ref()
                 .and_then(|absolute| absolute.to_str())
                 .map(|s| s.to_string())
                 .unwrap_or_default();
+
+            let status = scan_status_json(scan_status);
+
+            if let Some(status) = status {
+                self.status_buffer
+                    .lock()
+                    .unwrap()
+                    .push(FileScanStatusJson { path: path.clone(), status });
+            }
+
+            let mut matching_rules = scan_results.peekable();
+
+            if matching_rules.peek().is_none() {
+                return false;
+            }
 
             // prepare the increment *outside* the critical section
             let matching_rules = matching_rules.map(|rule| {
@@ -1125,6 +1219,7 @@ mod output_handler {
 
                 MatchJson {
                     rule: rule.identifier().to_string(),
+                    scan_status: status,
                     meta,
                     file,
                     tags,
@@ -1145,24 +1240,39 @@ mod output_handler {
                 let mut lock = self.output_buffer.lock().unwrap();
                 std::mem::take(&mut *lock)
             };
+            let statuses = {
+                let mut lock = self.status_buffer.lock().unwrap();
+                std::mem::take(&mut *lock)
+            };
             let version = env!("CARGO_PKG_VERSION").to_string();
 
             let rendered_json = match self.output_options.count_only {
                 true => {
-                    let json_output = matches
-                        .iter()
-                        .fold(HashMap::new(), |mut acc, it| {
-                            *acc.entry(&it.file).or_insert(0) += 1;
-                            acc
-                        })
+                    let mut counts = HashMap::new();
+                    for match_ in &matches {
+                        *counts.entry(match_.file.as_str()).or_insert(0) += 1;
+                    }
+                    for status in &statuses {
+                        counts.entry(status.path.as_str()).or_insert(0);
+                    }
+
+                    let json_output = counts
                         .into_iter()
-                        .map(|(path, count)| JsonCountOutput { path, count })
+                        .map(|(path, count)| JsonCountOutput {
+                            path,
+                            count,
+                            scan_status: statuses
+                                .iter()
+                                .find(|status| status.path == path)
+                                .map(|status| status.status),
+                        })
                         .collect::<Vec<_>>();
 
                     serde_json::to_string_pretty(&json_output)
                 }
                 false => {
-                    let output_json = OutputJson { matches, version };
+                    let output_json =
+                        OutputJson { matches, version, scan_status: statuses };
 
                     serde_json::to_string_pretty(&output_json)
                 }

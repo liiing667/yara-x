@@ -692,6 +692,212 @@ fn count_omits_non_matching_files() {
         .stdout("");
 }
 
+#[test]
+fn max_scan_size_reports_truncation() {
+    let temp_dir = TempDir::new().unwrap();
+    let rules_file = temp_dir.child("rules.yar");
+    let sample = temp_dir.child("sample.bin");
+
+    // The first 10 bytes match `probe`. `tail` only exists after the scan
+    // limit, so it must not match when the sample is truncated.
+    let contents = "0123456789".to_string() + &"x".repeat(90) + "TAIL";
+    sample.write_str(&contents).unwrap();
+
+    rules_file
+        .write_str(
+            r#"
+            rule probe {
+                strings:
+                    $a = "0123456789"
+                condition:
+                    $a
+            }
+            rule tail {
+                strings:
+                    $a = "TAIL"
+                condition:
+                    $a
+            }
+            "#,
+        )
+        .unwrap();
+
+    let original_size = contents.len();
+    let scanned_size = 10;
+
+    // Text output contains the truncated probe rule and an explicit status
+    // line with the original size, scanned size and reason.
+    let output = Command::new(cargo_bin!("yr"))
+        .arg("scan")
+        .arg(format!("--max-scan-size={scanned_size}"))
+        .arg(rules_file.path())
+        .arg(sample.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(output).unwrap();
+    assert!(stdout.contains("probe "), "stdout: {stdout}");
+    assert!(!stdout.contains("tail "), "stdout: {stdout}");
+    assert!(stdout.contains("scan truncated"), "stdout: {stdout}");
+    assert!(
+        stdout.contains(&format!("original_size={original_size}")),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("scanned_size={scanned_size}")),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("reason=max_scan_size"), "stdout: {stdout}");
+
+    // NDJSON carries the same status even though only one rule matched.
+    let output = Command::new(cargo_bin!("yr"))
+        .arg("scan")
+        .arg("--output-format=ndjson")
+        .arg(format!("--max-scan-size={scanned_size}"))
+        .arg(rules_file.path())
+        .arg(sample.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let line: serde_json::Value =
+        serde_json::from_slice(&output).expect("valid NDJSON");
+    assert_eq!(line["rules"].as_array().unwrap().len(), 1);
+    assert_eq!(line["rules"][0]["identifier"], "probe");
+    assert_eq!(line["scan_status"]["status"], "truncated");
+    assert_eq!(line["scan_status"]["truncated"], true);
+    assert_eq!(line["scan_status"]["original_size"], original_size);
+    assert_eq!(line["scan_status"]["scanned_size"], scanned_size);
+    assert_eq!(line["scan_status"]["reason"], "max_scan_size");
+
+    // JSON carries the status both on the matching rule and at the top level.
+    let output = Command::new(cargo_bin!("yr"))
+        .arg("scan")
+        .arg("--output-format=json")
+        .arg(format!("--max-scan-size={scanned_size}"))
+        .arg(rules_file.path())
+        .arg(sample.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value =
+        serde_json::from_slice(&output).expect("valid JSON");
+    let matches = json["matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0]["rule"], "probe");
+    assert_eq!(matches[0]["scan_status"]["truncated"], true);
+    assert_eq!(matches[0]["scan_status"]["original_size"], original_size);
+    assert_eq!(matches[0]["scan_status"]["scanned_size"], scanned_size);
+    assert_eq!(matches[0]["scan_status"]["reason"], "max_scan_size");
+
+    let statuses = json["scan_status"].as_array().unwrap();
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0]["truncated"], true);
+    assert_eq!(statuses[0]["original_size"], original_size);
+    assert_eq!(statuses[0]["scanned_size"], scanned_size);
+    assert_eq!(statuses[0]["reason"], "max_scan_size");
+}
+
+#[test]
+fn max_scan_size_reports_clean_truncated_file() {
+    let temp_dir = TempDir::new().unwrap();
+    let rules_file = temp_dir.child("rules.yar");
+    let sample = temp_dir.child("clean.bin");
+
+    sample.write_str(&"A".repeat(100)).unwrap();
+
+    rules_file
+        .write_str(
+            r#"
+            rule never {
+                strings:
+                    $a = "not-present"
+                condition:
+                    $a
+            }
+            "#,
+        )
+        .unwrap();
+
+    // A truncated file with no matches still produces a text status line, so
+    // it isn't mistaken for a fully scanned clean file.
+    Command::new(cargo_bin!("yr"))
+        .arg("scan")
+        .arg("--max-scan-size=10")
+        .arg(rules_file.path())
+        .arg(sample.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("scan truncated"))
+        .stdout(predicate::str::contains("original_size=100"))
+        .stdout(predicate::str::contains("scanned_size=10"))
+        .stdout(predicate::str::contains("reason=max_scan_size"));
+
+    // NDJSON must not omit a truncated file just because no rule matched.
+    let output = Command::new(cargo_bin!("yr"))
+        .arg("scan")
+        .arg("--output-format=ndjson")
+        .arg("--max-scan-size=10")
+        .arg(rules_file.path())
+        .arg(sample.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let line: serde_json::Value =
+        serde_json::from_slice(&output).expect("valid NDJSON");
+    assert!(line["rules"].as_array().unwrap().is_empty());
+    assert_eq!(line["scan_status"]["truncated"], true);
+    assert_eq!(line["scan_status"]["original_size"], 100);
+    assert_eq!(line["scan_status"]["scanned_size"], 10);
+
+    // JSON must expose the truncated file even though `matches` is empty.
+    let output = Command::new(cargo_bin!("yr"))
+        .arg("scan")
+        .arg("--output-format=json")
+        .arg("--max-scan-size=10")
+        .arg(rules_file.path())
+        .arg(sample.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value =
+        serde_json::from_slice(&output).expect("valid JSON");
+    assert!(json["matches"].as_array().unwrap().is_empty());
+    let statuses = json["scan_status"].as_array().unwrap();
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0]["original_size"], 100);
+    assert_eq!(statuses[0]["scanned_size"], 10);
+    assert_eq!(statuses[0]["reason"], "max_scan_size");
+
+    // Count-only output also keeps the truncation status.
+    let output = Command::new(cargo_bin!("yr"))
+        .arg("scan")
+        .arg("--output-format=ndjson")
+        .arg("--count")
+        .arg("--max-scan-size=10")
+        .arg(rules_file.path())
+        .arg(sample.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let line: serde_json::Value =
+        serde_json::from_slice(&output).expect("valid NDJSON");
+    assert_eq!(line["count"], 0);
+    assert_eq!(line["scan_status"]["original_size"], 100);
+    assert_eq!(line["scan_status"]["scanned_size"], 10);
+}
+
 // Regression test for https://github.com/VirusTotal/yara-x/issues/785.
 //
 // When `yr scan` runs in an interactive terminal (both `stdout` and `stderr`

@@ -74,6 +74,7 @@ pub use scanner::ProfilingData;
 pub use scanner::ScanError;
 pub use scanner::ScanOptions;
 pub use scanner::ScanResults;
+pub use scanner::ScanStatus;
 pub use scanner::Scanner;
 pub use scanner::blocks;
 pub use variables::Variable;

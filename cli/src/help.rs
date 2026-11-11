@@ -148,6 +148,14 @@ more matches. This can affect rules that rely on the number of occurrences of
 some pattern. For instance, the expression `#a > 100` will be false if this 
 limit is set to 100 or less."#;
 
+pub const MAX_SCAN_SIZE_LONG_HELP: &str = r#"Maximum number of bytes scanned from each file
+
+When a file is larger than this limit, only its first N bytes are scanned and
+rules are evaluated against that truncated data. The scan result explicitly
+reports the scan as truncated, including the original file size, the number of
+bytes actually scanned and the reason (`max_scan_size`). This information is
+included in text, `json` and `ndjson` output."#;
+
 pub const MODULE_DATA_LONG_HELP: &str = r#"Pass FILE's content as extra data to MODULE
 
 Some modules require supplementary data to work, in addition to the scanned

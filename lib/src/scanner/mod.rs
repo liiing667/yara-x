@@ -97,6 +97,124 @@ pub enum ScanError {
     },
 }
 
+/// Status of a scan operation.
+///
+/// A scan can complete normally after inspecting the entire input, or it can
+/// complete after inspecting only a prefix of it. The latter happens when the
+/// input is larger than the limit configured with [`Scanner::max_scan_size`].
+///
+/// Truncation is a successful scan status, not an error. This allows callers
+/// to distinguish a genuinely clean input from one for which only a portion of
+/// the data was inspected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanStatus {
+    /// The complete input was scanned.
+    Complete,
+    /// Only a prefix of the input was scanned.
+    Truncated {
+        /// Size of the original input, in bytes.
+        original_size: u64,
+        /// Number of bytes that were actually scanned.
+        scanned_size: u64,
+        /// Stable identifier for the reason why the input was truncated.
+        ///
+        /// Currently this is always
+        /// [`ScanStatus::MAX_SCAN_SIZE_REASON`].
+        reason: &'static str,
+    },
+}
+
+impl ScanStatus {
+    /// Stable reason identifier used when [`Scanner::max_scan_size`] truncates
+    /// the scanned data.
+    pub const MAX_SCAN_SIZE_REASON: &'static str = "max_scan_size";
+
+    /// Returns `true` if the input was truncated before it was scanned.
+    pub fn is_truncated(&self) -> bool {
+        matches!(self, Self::Truncated { .. })
+    }
+
+    /// Returns `true` if the input was truncated before it was scanned.
+    ///
+    /// This is an alias for [`ScanStatus::is_truncated`].
+    pub fn truncated(&self) -> bool {
+        self.is_truncated()
+    }
+
+    /// Returns `true` if the complete input was scanned.
+    pub fn is_complete(&self) -> bool {
+        matches!(self, Self::Complete)
+    }
+
+    /// Returns the size of the original input if it was truncated.
+    pub fn original_size(&self) -> Option<u64> {
+        match self {
+            Self::Truncated { original_size, .. } => Some(*original_size),
+            Self::Complete => None,
+        }
+    }
+
+    /// Returns the size of the original file if it was truncated.
+    ///
+    /// This is an alias for [`ScanStatus::original_size`].
+    pub fn original_file_size(&self) -> Option<u64> {
+        self.original_size()
+    }
+
+    /// Returns the size of the original input if it was truncated.
+    ///
+    /// This is an alias for [`ScanStatus::original_size`].
+    pub fn original_length(&self) -> Option<u64> {
+        self.original_size()
+    }
+
+    /// Returns the number of bytes that were actually scanned if the input
+    /// was truncated.
+    pub fn scanned_size(&self) -> Option<u64> {
+        match self {
+            Self::Truncated { scanned_size, .. } => Some(*scanned_size),
+            Self::Complete => None,
+        }
+    }
+
+    /// Returns the number of bytes that were actually scanned if the input
+    /// was truncated.
+    ///
+    /// This is an alias for [`ScanStatus::scanned_size`].
+    pub fn scanned_length(&self) -> Option<u64> {
+        self.scanned_size()
+    }
+
+    /// Returns the reason why the input was truncated, if it was truncated.
+    pub fn reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Truncated { reason, .. } => Some(*reason),
+            Self::Complete => None,
+        }
+    }
+
+    /// Returns the reason why the input was truncated, if it was truncated.
+    ///
+    /// This is an alias for [`ScanStatus::reason`].
+    pub fn truncation_reason(&self) -> Option<&'static str> {
+        self.reason()
+    }
+}
+
+impl std::fmt::Display for ScanStatus {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Complete => f.write_str("complete"),
+            Self::Truncated { original_size, scanned_size, reason } => {
+                write!(
+                    f,
+                    "truncated (original_size={original_size}, scanned_size={scanned_size}, reason={reason})"
+                )
+            }
+        }
+    }
+}
+
 /// Global counter that gets incremented every 1 second by a dedicated thread.
 ///
 /// This counter is used for determining when a scan operation has timed out.
@@ -310,6 +428,10 @@ impl<'r> Scanner<'r> {
     /// The value returned by `filesize` will be also limited to the given
     /// size.
     ///
+    /// When the input is truncated, [`ScanResults::scan_status`] returns
+    /// [`ScanStatus::Truncated`] with the original size, the number of bytes
+    /// actually scanned, and the reason for the truncation.
+    ///
     /// Also notice that some modules (pe, elf, macho, etc) may be unable
     /// to properly parse truncated files.
     pub fn max_scan_size(&mut self, size: usize) -> &mut Self {
@@ -348,13 +470,8 @@ impl<'r> Scanner<'r> {
         &'a mut self,
         data: &'a [u8],
     ) -> Result<ScanResults<'a, 'r>, ScanError> {
-        let mut data = data;
-        if let Some(max) = self.max_scan_size
-            && data.len() > max
-        {
-            data = &data[..max];
-        }
-        self.scan_impl(ScannedData::Slice(data), None)
+        let (data, status) = truncate_data(data, self.max_scan_size);
+        self.scan_impl(ScannedData::Slice(data), status, None)
     }
 
     /// Scans a file.
@@ -365,7 +482,8 @@ impl<'r> Scanner<'r> {
     where
         P: AsRef<Path>,
     {
-        self.scan_impl(self.load_file(target.as_ref())?, None)
+        let (data, status) = self.load_file(target.as_ref())?;
+        self.scan_impl(data, status, None)
     }
 
     /// Like [`Scanner::scan`], but allows to specify additional scan options.
@@ -374,13 +492,8 @@ impl<'r> Scanner<'r> {
         data: &'a [u8],
         options: ScanOptions<'opts>,
     ) -> Result<ScanResults<'a, 'r>, ScanError> {
-        let mut data = data;
-        if let Some(max) = self.max_scan_size
-            && data.len() > max
-        {
-            data = &data[..max];
-        }
-        self.scan_impl(ScannedData::Slice(data), Some(options))
+        let (data, status) = truncate_data(data, self.max_scan_size);
+        self.scan_impl(ScannedData::Slice(data), status, Some(options))
     }
 
     /// Like [`Scanner::scan_file`], but allows to specify additional scan
@@ -393,7 +506,8 @@ impl<'r> Scanner<'r> {
     where
         P: AsRef<Path>,
     {
-        self.scan_impl(self.load_file(target.as_ref())?, Some(options))
+        let (data, status) = self.load_file(target.as_ref())?;
+        self.scan_impl(data, status, Some(options))
     }
 
     /// Sets the value of a global variable.
@@ -562,15 +676,25 @@ impl<'r> Scanner<'r> {
     fn load_file<'a>(
         &self,
         path: &Path,
-    ) -> Result<ScannedData<'a>, ScanError> {
+    ) -> Result<(ScannedData<'a>, ScanStatus), ScanError> {
         let file = fs::File::open(path).map_err(|err| {
             ScanError::OpenError { path: path.to_path_buf(), err }
         })?;
 
-        let mut size = file.metadata().map(|m| m.len()).unwrap_or(0) as usize;
+        let original_size =
+            file.metadata().map(|m| m.len()).unwrap_or(0) as usize;
+        let mut size = original_size;
+        let mut status = ScanStatus::Complete;
 
         if let Some(max_scan_size) = self.max_scan_size {
-            size = std::cmp::min(size, max_scan_size);
+            if original_size > max_scan_size {
+                size = max_scan_size;
+                status = ScanStatus::Truncated {
+                    original_size: original_size as u64,
+                    scanned_size: size as u64,
+                    reason: ScanStatus::MAX_SCAN_SIZE_REASON,
+                };
+            }
         }
 
         // For files smaller than ~32MB reading the whole file is faster than
@@ -600,12 +724,17 @@ impl<'r> Scanner<'r> {
             ScannedData::Vec(buffered_file)
         };
 
-        Ok(data)
+        if let ScanStatus::Truncated { scanned_size, .. } = &mut status {
+            *scanned_size = data.len() as u64;
+        }
+
+        Ok((data, status))
     }
 
     fn scan_impl<'a, 'opts>(
         &'a mut self,
         data: ScannedData<'a>,
+        status: ScanStatus,
         options: Option<ScanOptions<'opts>>,
     ) -> Result<ScanResults<'a, 'r>, ScanError> {
         let ctx = self.scan_context_mut();
@@ -744,8 +873,30 @@ impl<'r> Scanner<'r> {
 
         ctx.scan_state = ScanState::Finished(DataSnippets::SingleBlock(data));
 
-        Ok(ScanResults::new(ctx))
+        Ok(ScanResults::new(ctx, status))
     }
+}
+
+fn truncate_data<'a>(
+    data: &'a [u8],
+    max_scan_size: Option<usize>,
+) -> (&'a [u8], ScanStatus) {
+    let original_size = data.len();
+
+    if let Some(max_scan_size) = max_scan_size
+        && original_size > max_scan_size
+    {
+        return (
+            &data[..max_scan_size],
+            ScanStatus::Truncated {
+                original_size: original_size as u64,
+                scanned_size: max_scan_size as u64,
+                reason: ScanStatus::MAX_SCAN_SIZE_REASON,
+            },
+        );
+    }
+
+    (data, ScanStatus::Complete)
 }
 
 /// Helper type that exposes the data matched during a scan operation.
@@ -842,6 +993,7 @@ impl DataSnippets<'_> {
 /// Allows iterating over both the matching and non-matching rules.
 pub struct ScanResults<'a, 'r> {
     ctx: &'a ScanContext<'r, 'a>,
+    status: ScanStatus,
 }
 
 impl Debug for ScanResults<'_, '_> {
@@ -851,8 +1003,28 @@ impl Debug for ScanResults<'_, '_> {
 }
 
 impl<'a, 'r> ScanResults<'a, 'r> {
-    fn new(ctx: &'a ScanContext<'r, 'a>) -> Self {
-        Self { ctx }
+    fn new(ctx: &'a ScanContext<'r, 'a>, status: ScanStatus) -> Self {
+        Self { ctx, status }
+    }
+
+    /// Returns the status of the scan operation.
+    ///
+    /// Use this to check whether the complete input was scanned, or whether
+    /// it was truncated because it exceeded [`Scanner::max_scan_size`].
+    pub fn scan_status(&self) -> ScanStatus {
+        self.status
+    }
+
+    /// Returns the status of the scan operation.
+    ///
+    /// This is an alias for [`ScanResults::scan_status`].
+    pub fn status(&self) -> ScanStatus {
+        self.status
+    }
+
+    /// Returns `true` if the scanned input was truncated.
+    pub fn is_truncated(&self) -> bool {
+        self.status.is_truncated()
     }
 
     /// Returns an iterator that yields the matching rules in arbitrary order.

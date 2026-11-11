@@ -5,7 +5,7 @@ use serde_json::json;
 
 use crate::models::MetaValue;
 use crate::variables::VariableError;
-use crate::{Rule, Scanner};
+use crate::{Rule, ScanStatus, Scanner};
 use crate::{ScanOptions, mods};
 
 #[cfg(feature = "rules-profiling")]
@@ -967,7 +967,9 @@ fn max_scan_size() {
     let mut scanner = Scanner::new(&rules);
 
     // Without truncation, it matches
-    assert_eq!(scanner.scan(b"aaaabbbb").unwrap().matching_rules().len(), 1);
+    let results = scanner.scan(b"aaaabbbb").unwrap();
+    assert_eq!(results.scan_status(), ScanStatus::Complete);
+    assert_eq!(results.matching_rules().len(), 1);
     assert_eq!(
         scanner
             .scan_file("src/tests/testdata/jumps.bin")
@@ -979,15 +981,35 @@ fn max_scan_size() {
 
     // With truncation to 2 bytes, it shouldn't match "aaaa" (4 bytes)
     scanner.max_scan_size(2);
-    assert_eq!(scanner.scan(b"aaaabbbb").unwrap().matching_rules().len(), 0);
+    let results = scanner.scan(b"aaaabbbb").unwrap();
     assert_eq!(
-        scanner
-            .scan_file("src/tests/testdata/jumps.bin")
-            .unwrap()
-            .matching_rules()
-            .len(),
-        0
+        results.scan_status(),
+        ScanStatus::Truncated {
+            original_size: 8,
+            scanned_size: 2,
+            reason: ScanStatus::MAX_SCAN_SIZE_REASON,
+        }
     );
+    assert_eq!(results.scan_status().original_size(), Some(8));
+    assert_eq!(results.scan_status().scanned_size(), Some(2));
+    assert_eq!(
+        results.scan_status().reason(),
+        Some(ScanStatus::MAX_SCAN_SIZE_REASON)
+    );
+    assert_eq!(results.matching_rules().len(), 0);
+
+    let results = scanner.scan_file("src/tests/testdata/jumps.bin").unwrap();
+    let original_size =
+        std::fs::metadata("src/tests/testdata/jumps.bin").unwrap().len();
+    assert_eq!(
+        results.scan_status(),
+        ScanStatus::Truncated {
+            original_size,
+            scanned_size: 2,
+            reason: ScanStatus::MAX_SCAN_SIZE_REASON,
+        }
+    );
+    assert_eq!(results.matching_rules().len(), 0);
 }
 
 #[cfg(feature = "test_proto2-module")]

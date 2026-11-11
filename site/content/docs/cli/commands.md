@@ -211,6 +211,17 @@ more matches. This can affect rules that rely on the number of occurrences of
 some pattern. For instance, the expression `#a > 100` will be false if this
 limit is set to 100 or less.
 
+### --max-scan-size \<FILE_SIZE\>
+
+Scan at most `<FILE_SIZE>` bytes from each file.
+
+Files larger than the limit are scanned using only their first `<FILE_SIZE>`
+bytes, and rules are evaluated against that truncated data. The scan result
+reports this explicitly as a truncated scan, including the original file size,
+the number of bytes actually scanned, and the reason (`max_scan_size`). This
+applies to text, `json` and `ndjson` output, so a truncated file is not
+indistinguishable from a fully scanned file that had no matches.
+
 ### --output-format \<FORMAT\>
 
 Specify the output format. Available options are `text`, `ndjson` and `json`.
